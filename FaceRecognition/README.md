@@ -94,16 +94,16 @@ port = 1883
 
 Run the program from terminal:
 1. Capture enough white list faces:
-   ```bash
+```bash
 python facecap.py
 ```
 2. Train the recognition model from your white list:
-   ```bash
+```bash
 python trainer_model.py
 ```
    
 3. Run face recognition main functionL:
-   ```bash
+```bash
 python faceselect2.py
 ```
 
