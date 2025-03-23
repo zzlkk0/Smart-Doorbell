@@ -27,7 +27,7 @@ This Face Recognition System performs real-time face detection and recognition b
 - Saving snapshots of strangers after prolonged presence
 - Optionally publishing results via MQTT
 
-![Description](images/doorbell.jpg)
+![Description](images/FaceRecognition.jpg)
 
 ---
 
