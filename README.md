@@ -51,7 +51,7 @@ This system integrates an OLED display, physical buttons, audio I/O, and network
 
 1. Clone the repository:
    ```bash
-   git clone https://example.com/smart-door-system.git
+   git clone https://github.com/zzlkk0/Smart-Doorbell.git
    cd smart-door-system
    ```
 
