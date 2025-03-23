@@ -53,5 +53,6 @@ This system integrates an OLED display, physical buttons, audio I/O, and network
    git clone https://example.com/smart-door-system.git
    cd smart-door-system
 2. Install dependency：
+   ```bash
     sudo apt-get install libportaudio2 portaudio19-dev libasound2-dev
     pip install -r requirements.txt
