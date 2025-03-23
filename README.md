@@ -57,6 +57,131 @@ cd Smart-Doorbell
   ```bash
   python \SmartDoorBell\door8.py
   ```
+---
+
+# 🔧 RTMP Streaming Setup with FFmpeg and Nginx
+
+This guide describes how to set up video/audio streaming using `ffmpeg` and an Nginx RTMP server.
+
+---
+
+## 🚀 Start Nginx Server
+
+```bash
+sudo /usr/local/nginx/sbin/nginx
+```
+
+---
+
+## 🧪 Check Audio and Video Devices
+
+```bash
+ls /dev/video*
+arecord -l
+lsof /dev/snd/*
+```
+
+To stop conflicting processes:
+```bash
+kill -9 <PID>
+# Example:
+kill -9 4233
+```
+
+---
+
+## 📡 FFmpeg Streaming Commands
+
+> Replace `192.168.138.234` with your actual server IP address.
+
+### Simple Video + Audio Stream
+
+```bash
+ffmpeg -f v4l2 -framerate 2 -f alsa -i plughw:2,0 \
+  -acodec aac -ar 44100 -b:a 128k \
+  -f flv rtmp://192.168.138.234:8888/live1/stream
+```
+
+### With Resolution and Encoding Settings
+
+```bash
+ffmpeg -f v4l2 -framerate 2 -video_size 640x480 -i /dev/video0 \
+  -f alsa -i hw:3,0 \
+  -vcodec libx264 -preset veryfast -maxrate 300k -bufsize 300k \
+  -vf "format=yuv420p" -g 10 -keyint_min 3 \
+  -acodec aac -ar 44100 -b:a 128k \
+  -f flv rtmp://192.168.138.234:8888/live1/stream
+```
+
+### Alternative Stream Path
+
+```bash
+ffmpeg -f v4l2 -framerate 2 -video_size 640x480 -i /dev/video0 \
+  -f alsa -i hw:3,0 \
+  -acodec aac -ar 44100 -b:a 128k \
+  -f flv rtmp://192.168.138.234:8888/live/stream
+```
+
+---
+
+## ⚙️ Nginx Configuration File
+
+Edit the configuration:
+```bash
+sudo nano /usr/local/nginx/conf/nginx.conf
+```
+
+Reload the server:
+```bash
+sudo /usr/local/nginx/sbin/nginx -s reload
+```
+
+---
+
+## 📂 Permissions for HLS Folder
+
+```bash
+sudo chown -R www-data:www-data /tmp/hls
+sudo chmod -R 755 /tmp/hls
+```
+
+---
+
+## 🧰 Initialization (Recommended on First Use)
+
+```bash
+sudo mkdir -p /tmp/hls/live1
+sudo mkdir -p /tmp/hls/live2
+
+sudo /usr/local/nginx/sbin/nginx
+
+ffmpeg -f v4l2 -framerate 2 -video_size 640x480 -i /dev/video0 \
+  -f alsa -i hw:3,0 \
+  -vcodec libx264 -preset veryfast -maxrate 300k -bufsize 300k \
+  -vf "format=yuv420p" -g 10 -keyint_min 3 \
+  -acodec aac -ar 44100 -b:a 128k \
+  -f flv rtmp://192.168.138.234:8888/live1/stream
+```
+
+---
+
+## 📎 Notes
+
+- `video0`, `hw:3,0`, and `plughw:2,0` may vary depending on your system — verify with `ls /dev/video*` and `arecord -l`.
+- Ensure your Nginx build includes the `ngx_rtmp_module`.
+
+---
+
+Happy streaming! 📺
+
+
+
+
+
+
+
+
+---
 
 ---
 
