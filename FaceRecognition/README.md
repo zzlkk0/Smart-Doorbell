@@ -26,6 +26,7 @@ This Face Recognition System performs real-time face detection and recognition b
 - Differentiating between whitelisted, blacklisted, and unknown individuals
 - Saving snapshots of strangers after prolonged presence
 - Optionally publishing results via MQTT
+![Description](images/FaceRecognition.pdf)
 
 ---
 
