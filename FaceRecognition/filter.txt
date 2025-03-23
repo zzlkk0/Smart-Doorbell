@@ -1,0 +1,591 @@
+import time
+import threading
+import socket
+import os
+import smbus
+import pyaudio
+import wave
+import math
+from gpiozero import Button
+from signal import pause  # Use pause to keep the program running
+import gpiozero as zgpio
+import subprocess
+import paho.mqtt.client as mqtt
+import logging
+import tonghua
+import queue  # Import queue for thread-safe LCD operations
+
+# Initialize the audio player with an RTMP stream URL
+audio_player = tonghua.VLCAudioPlayer("rtmp://0.0.0.0:8889/live2/stream")
+
+# Configuration Variables
+MQTT_BROKER = "192.168.138.234"      # Replace with your MQTT broker address
+MQTT_PORT = 1883                     # Replace with your MQTT broker port if different
+MQTT_USERNAME = None                 # Replace with your MQTT username if required
+MQTT_PASSWORD = None                 # Replace with your MQTT password if required
+MQTT_TOPIC = "/homeassistant/sent/door"
+
+# Initialize I2C interface
+I2C_ADDR = 0x27  # I2C address for the 1602 LCD display
+bus = smbus.SMBus(1)
+
+# Initialize a thread-safe queue for LCD commands
+lcd_queue = queue.Queue()
+
+# Initialize 1602 LCD
+def lcd_init():
+    lcd_write(0x33)  # Initialize
+    lcd_write(0x32)  # Set to 4-bit mode
+    lcd_write(0x06)  # Cursor move direction
+    lcd_write(0x0C)  # Display on, cursor off
+    lcd_write(0x28)  # 2-line mode, 5x8 font
+    lcd_write(0x01)  # Clear display
+    time.sleep(0.005)
+
+def lcd_write(cmd, mode=0):
+    """
+    Write a command or character to the LCD.
+    
+    :param cmd: Command or character to send
+    :param mode: Mode flag (0 for command, 1 for character)
+    """
+    high = mode | (cmd & 0xF0) | 0x08
+    low = mode | ((cmd << 4) & 0xF0) | 0x08
+    bus.write_byte(I2C_ADDR, high)
+    lcd_toggle_enable(high)
+    bus.write_byte(I2C_ADDR, low)
+    lcd_toggle_enable(low)
+
+def lcd_toggle_enable(data):
+    """
+    Toggle the enable pin to latch the command/data.
+    
+    :param data: Data byte to toggle
+    """
+    time.sleep(0.0005)
+    bus.write_byte(I2C_ADDR, (data | 0x04))
+    time.sleep(0.0005)
+    bus.write_byte(I2C_ADDR, (data & ~0x04))
+    time.sleep(0.0005)
+
+def lcd_display_string_threadsafe(text, line, display_duration=2):
+    """
+    Enqueue the display string command to be handled by the LCD thread.
+    
+    :param text: Text to display
+    :param line: Line number (1 or 2)
+    :param display_duration: Time in seconds to display the text before clearing
+    """
+    lcd_queue.put((text, line, display_duration))
+
+def lcd_worker():
+    """
+    Worker thread that handles LCD display commands from the queue.
+    It displays the text on the specified line and clears it after the duration.
+    """
+    while True:
+        try:
+            item = lcd_queue.get()
+            if not item:
+                continue
+            text, line, duration = item
+            if text == "EXIT":
+                break  # Exit signal
+            lcd_display_string(text, line)
+            time.sleep(duration)  # Wait for the specified duration
+            lcd_display_string("", line)  # Clear the line after duration
+            lcd_queue.task_done()
+        except Exception as e:
+            print(f"Error in LCD worker: {e}")
+
+def lcd_display_string(text, line):
+    """
+    Writes a string to a specific line on the LCD.
+    This function is now called only by the LCD worker thread.
+    
+    :param text: Text to display
+    :param line: Line number (1 or 2)
+    """
+    if line == 1:
+        lcd_write(0x80)  # Set cursor to line 1
+    elif line == 2:
+        lcd_write(0xC0)  # Set cursor to line 2
+    for char in text.ljust(16, " "):
+        lcd_write(ord(char), 1)  # Mode 1 for character
+
+# Initialize buttons
+button1 = Button(21)
+button2 = Button(27)
+button3 = Button(22)
+button4 = Button(23)
+
+# Recording parameters
+CHUNK = 512
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+WAVE_OUTPUT_FILENAME = "output1.wav"
+
+# Initialize PyAudio
+p = pyaudio.PyAudio()
+
+# Server UDP address and port
+udp_server_address = ('192.168.138.234', 8699)
+
+# Create UDP socket
+udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket.settimeout(5)  # Set timeout to 5 seconds
+
+# TCP server address and port
+tcp_server_address = ('192.168.138.51', 8700)  # Modify to actual TCP server IP and port
+
+# Display initial screen
+def display_initial_screen():
+    lcd_display_string_threadsafe("1:Rec 2:Call", 1)
+    lcd_display_string_threadsafe("3:Bell 4:Open", 2)
+
+# Global variables and locks to track call status and timers
+call_active = False
+call_lock = threading.Lock()
+call_timer = None
+call_lock1 = threading.Lock()
+call_lock2 = threading.Lock()
+dooropen_lock = threading.Lock()
+
+# Auto hang-up function
+def auto_hang_up():
+    """
+    Automatically hangs up the call after a timeout.
+    """
+    global call_active, call_timer
+    with call_lock:
+        if call_active:
+            udp_socket.sendto(b'HANG_UP', udp_server_address)
+            lcd_display_string_threadsafe("Call ended (Timeout)", 1)
+            lcd_display_string_threadsafe("", 2)
+            call_active = False
+            call_timer = None
+    time.sleep(2)  
+    display_initial_screen()
+
+# Recording functionality
+def handle_recording():
+    """
+    Handles the recording functionality. Records audio for 10 seconds,
+    saves it to a WAV file, and sends it via TCP to the server.
+    """
+    lcd_display_string_threadsafe("Recording...", 1)
+    lcd_display_string_threadsafe("", 2)
+
+    record_start_time = time.time()
+
+    # Open audio stream
+    try:
+        stream = p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK
+        )
+    except Exception as e:
+        lcd_display_string_threadsafe("Stream error", 1)
+        print(f"Failed to open audio stream: {e}")
+        time.sleep(2)
+        display_initial_screen()
+        return
+
+    frames = []
+    try:
+        for _ in range(0, int(RATE / CHUNK * 10)):  # Record for 10 seconds
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                frames.append(data)
+            except Exception as e:
+                lcd_display_string_threadsafe("Recording error", 1)
+                print(f"Error during recording: {e}")
+                break
+    finally:
+        # Stop stream and release resources
+        stream.stop_stream()
+        stream.close()
+
+    # Save recording to file
+    try:
+        with wave.open(WAVE_OUTPUT_FILENAME, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(p.get_sample_size(FORMAT))
+            wf.setframerate(RATE)
+            wf.writeframes(b''.join(frames))
+    except Exception as e:
+        lcd_display_string_threadsafe("Save error", 1)
+        print(f"Failed to save audio file: {e}")
+        time.sleep(2)
+        display_initial_screen()
+        return
+
+    # Recording complete prompt
+    lcd_display_string_threadsafe("Recording done", 1)
+    lcd_display_string_threadsafe("", 2)
+    time.sleep(1)
+
+    # Send recording file via TCP
+    try:
+        # Establish TCP connection
+        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp_socket.connect(tcp_server_address)
+        print(f"Connected to TCP server at {tcp_server_address}")
+
+        # Send a fixed-length header 'RECORDING' (9 bytes)
+        tcp_socket.sendall(b'RECORDING')  # Ensure exactly 9 bytes
+
+        # Open and send the WAV file
+        with open(WAVE_OUTPUT_FILENAME, 'rb') as f:
+            while True:
+                data = f.read(1024)
+                if not data:
+                    break
+                tcp_socket.sendall(data)
+        print("WAV file sent successfully via TCP.")
+
+        tcp_socket.close()
+    except Exception as e:
+        lcd_display_string_threadsafe("Send error", 1)
+        print(f"Failed to send recording via TCP: {e}")
+        time.sleep(2)
+        display_initial_screen()
+        return
+
+    lcd_display_string_threadsafe("File sent", 1)
+    lcd_display_string_threadsafe("", 2)
+    time.sleep(2)
+    display_initial_screen()
+
+in_call_thread = False
+
+def call_thread():
+    """
+    Handles the call logic in a separate thread.
+    Manages call initiation, acceptance, talking duration, and termination.
+    """
+    global call_active, in_call_thread
+
+    with call_lock1:
+        if not call_active:  # If call has been hung up, exit thread
+            in_call_thread = False
+            return
+
+        # Send call request
+        udp_socket.sendto(b'CALL_REQUEST', udp_server_address)
+        lcd_display_string_threadsafe("Calling...", 1)
+        lcd_display_string_threadsafe("", 2)
+
+        call_start_time = time.time()
+
+        while call_active:
+            # Check for timeout (e.g., 10 seconds)
+            if time.time() - call_start_time > 10:
+                udp_socket.sendto(b'HANG_UP', udp_server_address)
+                lcd_display_string_threadsafe("No answer", 1)
+                lcd_display_string_threadsafe("", 2)
+                call_active = False
+                time.sleep(1)
+                break
+
+            # Receive response from the server
+            try:
+                udp_socket.settimeout(0.1)  # Check for response every 0.1 seconds
+                data, addr = udp_socket.recvfrom(1024)
+                message = data.decode()
+
+                if message == "ACCEPT_CALL":
+                    # Call accepted, start talking
+                    lcd_display_string_threadsafe("Call answered", 1)
+                    lcd_display_string_threadsafe("", 2)
+                    time.sleep(1)
+                    talking_start_time = time.time()
+                    lcd_display_string_threadsafe("Talking 0s", 1)
+                    audio_player.start()
+
+                    # Call duration loop
+                    while call_active:
+                        elapsed_time = int(time.time() - talking_start_time)
+                        lcd_display_string_threadsafe(f"Talking {elapsed_time}s", 1)
+
+                        # Check for hang-up from peer
+                        try:
+                            udp_socket.settimeout(1)
+                            data, addr = udp_socket.recvfrom(1024)
+                            message = data.decode()
+                            if message == "HANG_UP":  # Peer hung up
+                                call_active = False
+                                lcd_display_string_threadsafe("Call ended by peer", 1)
+                                lcd_display_string_threadsafe("", 2)
+                                time.sleep(2)
+                                audio_player.stop()
+                                break
+                        except socket.timeout:
+                            continue  # No message received, continue timing
+                        except OSError as e:
+                            if e.errno == 9:
+                                print("Socket has been closed. Exiting thread.")
+                                call_active = False
+                                break
+                            else:
+                                raise
+                    break
+
+                elif message == "REJECT_CALL":  # Call rejected
+                    udp_socket.sendto(b'HANG_UP', udp_server_address)
+                    lcd_display_string_threadsafe("Call rejected", 1)
+                    lcd_display_string_threadsafe("", 2)
+                    call_active = False
+                    time.sleep(1)
+                    break
+
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if e.errno == 9:
+                    print("Socket has been closed. Exiting thread.")
+                    call_active = False
+                    break
+                else:
+                    raise
+
+        # Call ended, perform cleanup
+        lcd_display_string_threadsafe("Call ended", 1)
+        lcd_display_string_threadsafe("", 2)
+        time.sleep(2)
+        display_initial_screen()
+        in_call_thread = False  # Mark thread as finished
+
+def handle_call():
+    """
+    Handles the call button press event.
+    Initiates or terminates a call based on the current call state.
+    """
+    global call_active, in_call_thread
+
+    with call_lock2:
+        if not call_active:
+            # Start call
+            call_active = True
+            if not in_call_thread:
+                in_call_thread = True
+                threading.Thread(target=call_thread, daemon=True).start()
+        else:
+            # Hang up call
+            call_active = False
+            udp_socket.sendto(b'HANG_UP', udp_server_address)
+            lcd_display_string_threadsafe("Call ended", 1)
+            lcd_display_string_threadsafe("", 2)
+            audio_player.stop()
+            time.sleep(2)
+            display_initial_screen()
+
+# Doorbell functionality
+def get_default_sink():
+    """
+    Retrieves the default audio sink using pactl.
+    
+    :return: Default sink name or None if retrieval fails
+    """
+    try:
+        output = subprocess.check_output(['pactl', 'get-default-sink']).decode().strip()
+        return output
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving default sink: {e}")
+    return None
+
+def get_volume(sink):
+    """
+    Retrieves the current volume of the specified sink.
+    
+    :param sink: Sink name
+    :return: Volume as a string (e.g., '100%') or '100%' if retrieval fails
+    """
+    try:
+        output = subprocess.check_output(['pactl', 'get-sink-volume', sink]).decode()
+        # Example output: "Volume: front-left: 65536 / 100% / 0.00 dB, front-right: 65536 / 100% / 0.00 dB"
+        volumes = [line.split('/')[1].strip() for line in output.splitlines() if '/' in line]
+        if volumes:
+            # Calculate average volume if multiple channels
+            volumes = [int(v.replace('%', '')) for v in volumes]
+            average_volume = sum(volumes) // len(volumes)
+            return f"{average_volume}%"
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving volume for sink '{sink}': {e}")
+    return '100%'  # Default volume if retrieval fails
+
+def set_volume(sink, volume):
+    """
+    Sets the volume for the specified sink.
+    
+    :param sink: Sink name
+    :param volume: Volume level (e.g., '50%')
+    """
+    try:
+        subprocess.run(['pactl', 'set-sink-volume', sink, volume], check=True)
+        print(f"Set {sink} volume to {volume}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error setting volume for sink '{sink}': {e}")
+
+def handle_doorbell():
+    """
+    Handles the doorbell button press event.
+    Displays doorbell information, adjusts volume, plays sound, and restores volume.
+    """
+    # Display doorbell ringing information
+    lcd_display_string_threadsafe("Doorbell ringing", 1)
+    lcd_display_string_threadsafe("", 2)
+
+    # Get default sink
+    default_sink = get_default_sink()
+    if not default_sink:
+        print("Could not determine default sink. Exiting.")
+        return
+
+    # Initialize original_volume with a default value
+    original_volume = '100%'  # Default to 100% in case retrieval fails
+
+    try:
+        # Get current volume to restore it later
+        original_volume = get_volume(default_sink)
+        print(f"Original {default_sink} Volume: {original_volume}")
+
+        # Set volume to 50%
+        set_volume(default_sink, '50%')
+
+        # Play doorbell sound effect
+        subprocess.run(['aplay', '/home/link/doorbell/doorbell.wav'], check=True)
+        print("Played doorbell sound")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing command: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    finally:
+        # Restore original volume
+        set_volume(default_sink, original_volume)
+    time.sleep(2)
+    display_initial_screen()
+
+# Open door request
+def handle_open_request():
+    """
+    Handles the open door button press event.
+    Sends an open door request to the server and updates the LCD.
+    """
+    udp_socket.sendto(b'OPEN_DOOR_REQUEST', udp_server_address)
+    lcd_display_string_threadsafe("Open request has", 1)
+    lcd_display_string_threadsafe("been sent", 2)
+    time.sleep(2)
+    display_initial_screen()
+
+# Multithreading: Listen for door open commands from server
+def listen_for_open_command():
+    """
+    Listens for door open commands via UDP and MQTT.
+    Updates the LCD accordingly when a door open command is received.
+    """
+    with dooropen_lock:
+        # Setup MQTT Client
+        mqtt_client = mqtt.Client()
+
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                print("Connected to MQTT Broker!")
+                client.subscribe(MQTT_TOPIC)
+                print(f"Subscribed to MQTT topic: {MQTT_TOPIC}")
+            else:
+                print(f"Failed to connect to MQTT Broker, return code {rc}")
+
+        def on_message(client, userdata, msg):
+            try:
+                payload = msg.payload.decode().strip()
+                print(f"Received MQTT message {payload} on topic {msg.topic}")
+
+                if msg.topic == MQTT_TOPIC and payload == "1":
+                    # Perform the door open actions
+                    lcd_display_string_threadsafe("Door is open", 1)
+                    lcd_display_string_threadsafe("", 2)
+                    time.sleep(2)
+                    display_initial_screen()
+
+                    # Publish '0' back to indicate completion
+                    client.publish(MQTT_TOPIC, "0")
+                    print(f"Published '0' to MQTT topic {MQTT_TOPIC} to indicate completion.")
+            except Exception as e:
+                print(f"Error processing MQTT message: {e}")
+
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_message = on_message
+
+        try:
+            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        except Exception as e:
+            print(f"Unable to connect to MQTT Broker: {e}")
+            return
+
+        # Start MQTT loop in a separate thread
+        mqtt_client.loop_start()
+
+        try:
+            while True:
+                try:
+                    data, _ = udp_socket.recvfrom(1024)
+                    if data == b'OPEN_DOOR':
+                        lcd_display_string_threadsafe("Door is open", 1)
+                        lcd_display_string_threadsafe("", 2)
+                        time.sleep(2)
+                        display_initial_screen()
+                except socket.timeout:
+                    continue  # Continue waiting on timeout
+                except TimeoutError:
+                    continue  # Handle timeout errors
+                except OSError as e:
+                    if e.errno == 9:
+                        print("Socket has been closed. Exiting thread.")
+                        break
+                    else:
+                        raise
+        except KeyboardInterrupt:
+            print("Interrupted by user. Shutting down.")
+        finally:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+            # Do not close udp_socket here because other threads are still using it
+            print("Cleaned up MQTT connections.")
+
+# Start the LCD worker thread
+lcd_thread = threading.Thread(target=lcd_worker, daemon=True)
+lcd_thread.start()
+
+# Initialize and display the initial screen
+lcd_init()
+display_initial_screen()
+
+# Bind button events
+button1.when_pressed = handle_recording
+button2.when_pressed = handle_call
+button3.when_pressed = handle_doorbell
+button4.when_pressed = handle_open_request
+
+# Start the thread that listens for open door commands
+threading.Thread(target=listen_for_open_command, daemon=True).start()
+
+# Use pause to keep the program running and allow gpiozero to handle events
+try:
+    pause()
+except KeyboardInterrupt:
+    if call_timer is not None:
+        call_timer.cancel()
+    udp_socket.close()
+    p.terminate()
+    # Send exit signal to LCD thread
+    lcd_queue.put(("EXIT", 0, 0))
+    lcd_thread.join()
