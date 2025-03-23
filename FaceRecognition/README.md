@@ -61,7 +61,7 @@ This Face Recognition System performs real-time face detection and recognition b
    If hosted on GitHub:
    ```bash
    git clone https://github.com/zzlkk0/Smart-Doorbell.git
-   cd \FaceRecognition
+   cd Smart-Doorbell\FaceRecognition
    ```
 
 ---
