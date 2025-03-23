@@ -19,6 +19,8 @@
 ---
 
 ## Overview
+The main python file is `\SamrtDoorbell\door8.py`.
+
 This system integrates an OLED display, physical buttons, audio I/O, and network protocols to enable:
 - Voice calls over UDP/TCP
 - Audio recording/playback
