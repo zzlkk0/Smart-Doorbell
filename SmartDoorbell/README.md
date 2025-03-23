@@ -28,6 +28,7 @@ This system integrates an OLED display, physical buttons, audio I/O, and network
 - Door control via servo motor
 - Remote control via MQTT
 
+![Description](images/doorbell.jpg)
 ---
 
 ## Prerequisites
@@ -54,7 +55,7 @@ This system integrates an OLED display, physical buttons, audio I/O, and network
 1. Clone the repository:
    ```bash
    git clone https://github.com/zzlkk0/Smart-Doorbell.git
-   cd smart-door-system
+   cd Smart-Doorbell/SmartDoorbell
    ```
 
 2. Install dependencies:
