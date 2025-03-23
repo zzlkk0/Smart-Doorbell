@@ -1,5 +1,5 @@
 
-# Smart Door Access System
+# Smart Doorbell
 
 This project integrates two core modules: a **Smart Doorbell & Control System** and a **Face Recognition System**. Together, they provide secure and intelligent access control for homes, offices, or IoT projects.
 
